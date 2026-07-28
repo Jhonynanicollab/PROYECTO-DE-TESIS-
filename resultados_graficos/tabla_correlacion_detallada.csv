@@ -1,0 +1,14 @@
+Variable,Coeficiente_r,p_valor,Significancia
+Superficie agrícola total,-0.5408,< 1e-04,***
+Acceso a crédito agropecuario,-0.0727,0.00213,**
+Uso de abonos orgánicos,0.0194,0.4132,ns
+Uso de fertilizantes químicos,0.03,0.2052,ns
+Uso de plaguicidas,0.0025,0.9161,ns
+Riego tecnificado,-0.0079,0.7393,ns
+Capacitación recibida,-0.0769,0.001159,**
+Asistencia técnica recibida,-0.0464,0.05017,ns
+Pertenencia a asociación,-0.027,0.2537,ns
+Nivel educativo del productor,-0.0944,< 1e-04,***
+Superficie de la parcela,-0.2028,< 1e-04,***
+Latitud de la parcela,-0.0451,0.05688,ns
+Longitud de la parcela,0.1104,< 1e-04,***

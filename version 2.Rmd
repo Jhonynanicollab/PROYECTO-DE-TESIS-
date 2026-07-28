@@ -1,0 +1,538 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+---
+
+
+
+```{r}
+
+library(tidyverse)
+library(MASS)
+library(car)
+library(lmtest)
+library(rpart)
+library(randomForest)
+library(xgboost)
+library(caret)
+library(SHAPforxgboost)
+
+```
+
+
+
+
+
+```{r}
+
+
+ruta <- "E:/tesis/ena2024/ENA_2024/"
+
+caratula <- read_csv(paste0(ruta, "973-Modulo1893/CARATULA.csv")) %>%
+  filter(NOMBREDD == "PUNO") %>%
+  dplyr::select(NSEGM, ID_PROD, UA, CODIGO, NOMBREPV, NOMBREDI, LATITUD, LONGITUD)
+
+```
+
+```{r}
+cap200ab <- read_csv(paste0(ruta, "973-Modulo1895/03_CAP200AB.csv")) %>%
+  semi_join(caratula, by = c("NSEGM","ID_PROD","UA")) %>%
+  filter(P204_COD == 2615) %>% # Filtrar por PAPA NATIVA para evitar mezcla de cultivos y escalas
+  mutate(
+    produccion_kg = P219_EQUIV_KG,
+    superficie_ha = P217_SUP_ha,
+    rendimiento   = produccion_kg / superficie_ha
+  ) %>%
+  filter(is.finite(rendimiento), rendimiento > 0)
+
+# Nivel productor: promedio ponderado por superficie (recomendado)
+rendimiento_prod <- cap200ab %>%
+  group_by(NSEGM, ID_PROD, UA) %>%
+  summarise(
+    rendimiento_ha = weighted.mean(rendimiento, w = superficie_ha, na.rm = TRUE),
+    superficie_total = sum(superficie_ha, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+```{r}
+
+credito <- read_csv(paste0(ruta,"973-Modulo1909/17_CAP900.csv")) %>%
+  transmute(NSEGM, ID_PROD, UA, acceso_credito = as.integer(P901 == 1))
+
+insumos <- read_csv(paste0(ruta,"973-Modulo1899/07_CAP200E.csv")) %>%
+  group_by(NSEGM, ID_PROD, UA) %>%
+  summarise(
+    usa_abono       = as.integer(any(P236 == 1, na.rm = TRUE)),
+    usa_fertilizante = as.integer(any(P238 == 1, na.rm = TRUE)),
+    usa_plaguicida  = as.integer(any(P240 == 1, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+riego <- read_csv(paste0(ruta,"973-Modulo1893/01_CAP100A_04.csv")) %>%
+  group_by(NSEGM, ID_PROD, UA) %>%
+  summarise(riego_tecnificado = as.integer(any(P119 == 1, na.rm = TRUE)), .groups="drop")
+
+capacitacion <- read_csv(paste0(ruta,"973-Modulo1907/15_CAP700.csv")) %>%
+  transmute(NSEGM, ID_PROD, UA,
+            capacitacion = as.integer(P701 == 1),
+            asistencia_tecnica = as.integer(P704 == 1))
+
+asociacion <- read_csv(paste0(ruta,"973-Modulo1908/16_CAP800.csv")) %>%
+  transmute(NSEGM, ID_PROD, UA, pertenece_asociacion = as.integer(P801 == 1))
+
+# Filtrar al productor principal (P1100==1) para evitar duplicados por miembros del hogar
+educacion <- read_csv(paste0(ruta,"973-Modulo1911/19_CAP1100.csv")) %>%
+  filter(P1100 == 1) %>%
+  transmute(NSEGM, ID_PROD, UA, nivel_educativo = P1105) %>%
+  distinct(NSEGM, ID_PROD, UA, .keep_all = TRUE)
+
+superficie <- read_csv(paste0(ruta,"973-Modulo1893/01_CAP100A_03.csv")) %>%
+  group_by(NSEGM, ID_PROD, UA) %>%
+  summarise(superficie_parcela = sum(P105_SUP_ha, na.rm = TRUE), .groups="drop")
+
+```
+
+```{r}
+# Unir coordenadas de carátula para control espacial (latitud y longitud)
+data_final <- rendimiento_prod %>%
+  left_join(credito, by = c("NSEGM","ID_PROD","UA")) %>%
+  left_join(insumos, by = c("NSEGM","ID_PROD","UA")) %>%
+  left_join(riego, by = c("NSEGM","ID_PROD","UA")) %>%
+  left_join(capacitacion, by = c("NSEGM","ID_PROD","UA")) %>%
+  left_join(asociacion, by = c("NSEGM","ID_PROD","UA")) %>%
+  left_join(educacion, by = c("NSEGM","ID_PROD","UA")) %>%
+  left_join(superficie, by = c("NSEGM","ID_PROD","UA")) %>%
+  left_join(caratula %>% dplyr::select(NSEGM, ID_PROD, UA, LATITUD, LONGITUD), by = c("NSEGM","ID_PROD","UA")) %>%
+  dplyr::select(-NSEGM, -ID_PROD, -UA)
+
+```
+
+
+```{r}
+sapply(data_final, function(x) mean(is.na(x))) # % de NA por variable
+
+# Dicotómicas: NA -> 0 (no reportó = no accedió/no usó), documentar el supuesto en tesis
+data_final <- data_final %>%
+  mutate(across(c(acceso_credito, usa_abono, usa_fertilizante, usa_plaguicida,
+                  riego_tecnificado, capacitacion, asistencia_tecnica,
+                  pertenece_asociacion), ~replace_na(., 0)))
+
+# Nivel educativo (ordinal): imputar con la mediana
+data_final$nivel_educativo[is.na(data_final$nivel_educativo)] <- median(data_final$nivel_educativo, na.rm=TRUE)
+
+# Outliers en rendimiento: recorte por IQR (documentar cuántos se quitan)
+q <- quantile(data_final$rendimiento_ha, c(.25,.75), na.rm=TRUE)
+iqr <- IQR(data_final$rendimiento_ha, na.rm=TRUE)
+data_final <- data_final %>%
+  filter(rendimiento_ha >= q[1]-1.5*iqr, rendimiento_ha <= q[2]+1.5*iqr)
+
+# Transformación logarítmica para estabilizar varianza y mejorar ajuste lineal (R²)
+data_final <- data_final %>%
+  mutate(log_rendimiento = log(rendimiento_ha)) %>%
+  dplyr::select(-rendimiento_ha)
+
+# Centrar coordenadas geográficas para que el intercepto sea interpretable físicamente
+mean_lat <- mean(data_final$LATITUD, na.rm = TRUE)
+mean_lon <- mean(data_final$LONGITUD, na.rm = TRUE)
+data_final <- data_final %>%
+  mutate(
+    LATITUD = LATITUD - mean_lat,
+    LONGITUD = LONGITUD - mean_lon,
+    geo_inter = LATITUD * LONGITUD,
+    tech_index = usa_fertilizante + usa_plaguicida + riego_tecnificado,
+    scale_ratio = superficie_total / (superficie_parcela + 0.01)
+  )
+
+```
+
+
+```{r}
+skimr::skim(data_final)
+
+# Histograma premium del log-rendimiento
+ggplot(data_final, aes(log_rendimiento)) + 
+  geom_histogram(bins=30, fill="#4477AA", color="white", alpha=0.8) +
+  labs(title="Distribución del Logaritmo del Rendimiento Agrícola",
+       subtitle="Papa Nativa - Puno (ENA 2024)",
+       x="Log-Rendimiento (log(kg/ha))", y="Frecuencia") +
+  theme_minimal()
+
+# Excluir variables construidas para mantener limpio el corrplot original de 14 variables
+cor_vars <- dplyr::select(data_final, -geo_inter, -tech_index, -scale_ratio)
+cor_matrix <- cor(dplyr::select(cor_vars, where(is.numeric)), use="pairwise.complete.obs")
+
+# Renombrar para que las etiquetas salgan en español correcto en el gráfico
+colnames(cor_matrix) <- c("Sup. Total", "Crédito", "Abono", "Fertilizante", "Plaguicida", "Riego", 
+                          "Capacitación", "Asist. Técnica", "Asociación", "Educación", 
+                          "Sup. Parcela", "Latitud", "Longitud", "Log-Rendimiento")
+rownames(cor_matrix) <- colnames(cor_matrix)
+
+# Paleta de colores elegante y profesional (divergente frío-calor)
+col_palette <- colorRampPalette(c("#BB4444", "#EE9999", "#FFFFFF", "#77AADD", "#4477AA"))(200)
+
+corrplot::corrplot(cor_matrix, method="color", col=col_palette,  
+                   type="upper", order="hclust", 
+                   addCoef.col = "black", number.cex = 0.7, # Agregar coeficientes numéricos
+                   tl.col="black", tl.srt=45, tl.cex = 0.8, # Etiquetas
+                   diag=FALSE, mar=c(0,0,1,0),
+                   title="Matriz de Correlación de Variables del Estudio")
+
+```
+
+```{r}
+# --- Tabla Detallada de Coeficientes de Correlación de Pearson ---
+variables_es <- c("Superficie agrícola total", "Acceso a crédito agropecuario", "Uso de abonos orgánicos", 
+                  "Uso de fertilizantes químicos", "Uso de plaguicidas", "Riego tecnificado", 
+                  "Capacitación recibida", "Asistencia técnica recibida", "Pertenencia a asociación", 
+                  "Nivel educativo del productor", "Superficie de la parcela", "Latitud de la parcela", 
+                  "Longitud de la parcela")
+
+df_numeric <- dplyr::select(data_final, -geo_inter, -tech_index, -scale_ratio)
+target_var <- "log_rendimiento"
+predictor_cols <- setdiff(names(df_numeric), target_var)
+
+tabla_corr <- data.frame(
+  Variable = character(),
+  Coeficiente_r = numeric(),
+  p_valor = numeric(),
+  Significancia = character(),
+  stringsAsFactors = FALSE
+)
+
+for (i in seq_along(predictor_cols)) {
+  col_name <- predictor_cols[i]
+  test_res <- cor.test(df_numeric[[col_name]], df_numeric[[target_var]], method = "pearson")
+  p_val <- test_res$p.value
+  sig <- if (p_val < 0.001) "***" else if (p_val < 0.01) "**" else if (p_val < 0.05) "*" else "ns"
+  
+  tabla_corr <- rbind(tabla_corr, data.frame(
+    Variable = variables_es[i],
+    Coeficiente_r = round(test_res$estimate, 4),
+    p_valor = round(p_val, 6),
+    Significancia = sig,
+    stringsAsFactors = FALSE
+  ))
+}
+
+print("Tabla de Correlación de Pearson y Significancia:")
+knitr::kable(tabla_corr)
+```
+
+```{r}
+set.seed(123)
+idx   <- createDataPartition(data_final$log_rendimiento, p = 0.8, list = FALSE)
+train <- data_final[idx, ]
+test  <- data_final[-idx, ]
+
+```
+
+```{r}
+modelo_full <- lm(log_rendimiento ~ poly(superficie_total, 2) + poly(superficie_parcela, 2) + 
+                   acceso_credito + usa_abono + usa_fertilizante + usa_plaguicida + 
+                   riego_tecnificado + capacitacion + asistencia_tecnica + pertenece_asociacion + 
+                   nivel_educativo + LATITUD + LONGITUD, data = train)
+modelo_rlm <- stepAIC(modelo_full, direction = "both", trace = FALSE)
+summary(modelo_rlm)
+
+# Supuestos
+# shapiro.test tiene límite de 5000 obs, se usa muestra aleatoria si excede
+resid_rlm <- resid(modelo_rlm)
+set.seed(123)
+shapiro.test(sample(resid_rlm, min(5000, length(resid_rlm))))
+bptest(modelo_rlm)
+dwtest(modelo_rlm)
+vif(modelo_rlm)
+
+```
+
+
+```{r}
+ctrl <- trainControl(method = "cv", number = 5)
+modelo_arbol <- train(log_rendimiento ~ ., data = train, method = "rpart2",
+                       tuneLength = 10, trControl = ctrl)
+
+```
+
+
+```{r}
+modelo_rf <- train(log_rendimiento ~ ., data = train, method = "rf",
+                    tuneGrid = expand.grid(mtry = c(2,4,6,8)),
+                    trControl = ctrl, ntree = 500)
+```
+
+
+```{r}
+# --- XGBoost: entrenamiento directo (compatible con xgboost v3.x) ---
+# Preparar matrices
+train_x <- as.matrix(train %>% dplyr::select(-log_rendimiento))
+train_y <- train$log_rendimiento
+test_x  <- as.matrix(test  %>% dplyr::select(-log_rendimiento))
+test_y  <- test$log_rendimiento
+
+dtrain <- xgb.DMatrix(data = train_x, label = train_y)
+dtest  <- xgb.DMatrix(data = test_x,  label = test_y)
+
+# Búsqueda de hiperparámetros con cross-validation
+grid_xgb <- expand.grid(
+  max_depth = c(5, 6, 7),
+  eta       = c(0.02, 0.05, 0.1),
+  stringsAsFactors = FALSE
+)
+
+mejores <- data.frame()
+set.seed(123)
+for (i in 1:nrow(grid_xgb)) {
+  params <- list(
+    objective        = "reg:squarederror",
+    max_depth        = grid_xgb$max_depth[i],
+    eta              = grid_xgb$eta[i],
+    gamma            = 0,
+    colsample_bytree = 0.8,
+    min_child_weight = 1,
+    subsample        = 0.8
+  )
+  cv <- xgb.cv(
+    params  = params,
+    data    = dtrain,
+    nrounds = 300,
+    nfold   = 5,
+    early_stopping_rounds = 15,
+    verbose = 0
+  )
+  
+  # Detectar nombre de columna RMSE del evaluation_log (varía entre versiones)
+  eval_log <- as.data.frame(cv$evaluation_log)
+  rmse_col <- grep("test.*rmse.*mean", names(eval_log), value = TRUE)[1]
+  
+  # Obtener mejor iteración (fallback si best_iteration es NULL)
+  best_iter <- cv$best_iteration
+  if (is.null(best_iter) || length(best_iter) == 0) {
+    best_iter <- which.min(eval_log[[rmse_col]])
+  }
+  
+  mejores <- rbind(mejores, data.frame(
+    max_depth = grid_xgb$max_depth[i],
+    eta       = grid_xgb$eta[i],
+    nrounds   = best_iter,
+    rmse_cv   = eval_log[[rmse_col]][best_iter]
+  ))
+}
+
+# Seleccionar mejor combinación
+mejor <- mejores[which.min(mejores$rmse_cv), ]
+cat("Mejor configuración XGBoost:\n")
+print(mejor)
+
+# Entrenar modelo final con los mejores hiperparámetros
+params_final <- list(
+  objective        = "reg:squarederror",
+  max_depth        = mejor$max_depth,
+  eta              = mejor$eta,
+  gamma            = 0,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample        = 0.8
+)
+modelo_xgb <- xgb.train(
+  params  = params_final,
+  data    = dtrain,
+  nrounds = mejor$nrounds,
+  evals   = list(train = dtrain, test = dtest),
+  verbose = 0
+)
+
+```
+
+
+```{r}
+# --- Predicciones en test ---
+pred_xgb <- predict(modelo_xgb, dtest)
+
+predicciones <- tibble(
+  modelo = c("RLM","Arbol","RandomForest","XGBoost"),
+  RMSE = c(
+    RMSE(predict(modelo_rlm, test), test$log_rendimiento),
+    RMSE(predict(modelo_arbol, test), test$log_rendimiento),
+    RMSE(predict(modelo_rf, test), test$log_rendimiento),
+    RMSE(pred_xgb, test_y)
+  ),
+  MAE = c(
+    MAE(predict(modelo_rlm, test), test$log_rendimiento),
+    MAE(predict(modelo_arbol, test), test$log_rendimiento),
+    MAE(predict(modelo_rf, test), test$log_rendimiento),
+    MAE(pred_xgb, test_y)
+  ),
+  R2 = c(
+    R2(predict(modelo_rlm, test), test$log_rendimiento),
+    R2(predict(modelo_arbol, test), test$log_rendimiento),
+    R2(predict(modelo_rf, test), test$log_rendimiento),
+    R2(pred_xgb, test_y)
+  )
+)
+predicciones
+
+# Gráfico de Predicho vs. Observado para el mejor modelo (XGBoost)
+pred_df <- tibble(
+  Real = test_y,
+  Predicho = pred_xgb
+)
+
+ggplot(pred_df, aes(x = Real, y = Predicho)) +
+  geom_point(alpha = 0.6, color = "#2B4C7E", size = 1.8) +
+  geom_abline(slope = 1, intercept = 0, color = "#7F8C8D", linetype = "dashed", linewidth = 0.8) +
+  labs(
+    title = "Valores Predichos vs. Observados (XGBoost)",
+    subtitle = "Evaluación en el Conjunto de Prueba Independiente (Papa Nativa - Puno)",
+    x = "Log-Rendimiento Real (log(kg/ha))",
+    y = "Log-Rendimiento Predicho (log(kg/ha))"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5, face = "italic"),
+    axis.title = element_text(face = "bold", size = 10),
+    axis.text = element_text(size = 9)
+  )
+
+```
+
+
+```{r}
+# Coeficientes RLM ya están en summary(modelo_rlm)
+
+# Diccionario para mapear nombres de variables a español formal
+var_names_map <- c(
+  "superficie_total"     = "Sup. Total",
+  "acceso_credito"       = "Crédito",
+  "usa_abono"            = "Abono",
+  "usa_fertilizante"     = "Fertilizante",
+  "usa_plaguicida"       = "Plaguicida",
+  "riego_tecnificado"    = "Riego",
+  "capacitacion"         = "Capacitación",
+  "asistencia_tecnica"   = "Asist. Técnica",
+  "pertenece_asociacion" = "Asociación",
+  "nivel_educativo"      = "Educación",
+  "superficie_parcela"   = "Sup. Parcela",
+  "LATITUD"              = "Latitud",
+  "LONGITUD"             = "Longitud"
+)
+
+# --- 1. IMPORTANCIA DE VARIABLES (Random Forest) ---
+imp_rf <- varImp(modelo_rf)$importance
+imp_rf_df <- data.frame(
+  Feature = rownames(imp_rf),
+  Importance = imp_rf$Overall
+) %>%
+  mutate(Variable = var_names_map[Feature]) %>%
+  arrange(desc(Importance))
+
+ggplot(imp_rf_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "#2B4C7E", width = 0.7, color = "black", linewidth = 0.2) +
+  coord_flip() +
+  labs(
+    title = "Importancia de Variables (Random Forest)",
+    subtitle = "Basado en la Reducción de Impureza de Gini",
+    x = "Variable / Insumo",
+    y = "Importancia Relativa"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5, face = "italic"),
+    axis.title = element_text(face = "bold", size = 10),
+    axis.text = element_text(size = 9)
+  )
+
+# --- 2. IMPORTANCIA DE VARIABLES (XGBoost) ---
+imp_xgb <- xgb.importance(model = modelo_xgb)
+imp_xgb_df <- as.data.frame(imp_xgb) %>%
+  mutate(Variable_ES = var_names_map[Feature])
+
+ggplot(imp_xgb_df, aes(x = reorder(Variable_ES, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "#2C3E50", width = 0.7, color = "black", linewidth = 0.2) +
+  coord_flip() +
+  labs(
+    title = "Importancia de Variables (XGBoost)",
+    subtitle = "Basado en la Ganancia de Información (Gain)",
+    x = "Variable / Insumo",
+    y = "Ganancia de Información Relativa"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5, face = "italic"),
+    axis.title = element_text(face = "bold", size = 10),
+    axis.text = element_text(size = 9)
+  )
+
+# --- 3. SHAP VALUES (XGBoost - Interpretabilidad Global) ---
+shap_long <- shap.prep(xgb_model = modelo_xgb, X_train = train_x)
+shap.plot.summary(shap_long)
+
+# --- 4. ANEXO A: DIAGNÓSTICO DE OVERFITTING (Curva de Aprendizaje) ---
+eval_log <- as.data.frame(attr(modelo_xgb, "evaluation_log"))
+
+ggplot(eval_log, aes(x = iter)) +
+  geom_line(aes(y = train_rmse, color = "Entrenamiento"), linewidth = 1) +
+  geom_line(aes(y = test_rmse, color = "Prueba"), linewidth = 1, linetype = "dashed") +
+  scale_color_manual(values = c("Entrenamiento" = "#2B4C7E", "Prueba" = "#D35400")) +
+  labs(
+    title = "Curva de Aprendizaje del Modelo XGBoost",
+    subtitle = "Evolución del Error RMSE vs. Iteraciones de Entrenamiento",
+    x = "Iteración (Número de Árboles)",
+    y = "RMSE (Error Cuadrático Medio)",
+    color = "Subconjunto"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5, face = "italic"),
+    legend.position = "bottom",
+    axis.title = element_text(face = "bold", size = 10)
+  )
+
+# --- ANEXO B: SUPUESTO DE NORMALIDAD DE RESIDUOS (Q-Q Plot RLM) ---
+resid_rlm <- resid(modelo_rlm)
+qqnorm(resid_rlm, main = "Gráfico Q-Q de Normalidad de Residuos (RLM)",
+       xlab = "Cuantiles Teóricos", ylab = "Residuos Muestrales",
+       col = "#2B4C7E", pch = 19, cex = 0.8)
+qqline(resid_rlm, col = "#D35400", lwd = 2)
+
+# --- ANEXO C: EFECTO CETERIS PARIBUS (Efecto Marginal de Superficie Total) ---
+medians <- apply(train_x, 2, median)
+grid_size <- 100
+surf_grid <- seq(min(train_x[, "superficie_total"]), max(train_x[, "superficie_total"]), length.out = grid_size)
+
+synth_data <- matrix(rep(medians, each = grid_size), nrow = grid_size, byrow = FALSE)
+colnames(synth_data) <- colnames(train_x)
+synth_data[, "superficie_total"] <- surf_grid
+
+yhat_grid <- predict(modelo_xgb, synth_data)
+
+pdp_df <- tibble(
+  superficie_total = surf_grid,
+  yhat = yhat_grid
+)
+
+ggplot(pdp_df, aes(x = superficie_total, y = yhat)) +
+  geom_line(color = "#2B4C7E", linewidth = 1.2) +
+  labs(
+    title = "Efecto Ceteris Paribus de la Superficie Agrícola Total",
+    subtitle = "Efecto marginal no lineal estimado por XGBoost (Papa Nativa)",
+    x = "Superficie Agrícola Total (ha)",
+    y = "Log-Rendimiento Predicho (log(kg/ha))"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5, face = "italic"),
+    axis.title = element_text(face = "bold", size = 10)
+  )
+
+```
+
